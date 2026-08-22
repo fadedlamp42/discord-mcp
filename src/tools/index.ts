@@ -44,11 +44,43 @@ const allToolsets: Record<string, ToolModule> = {
 };
 
 /**
+ * True when `DISCORD_MCP_READ_ONLY` is set to anything except false/0/no/off.
+ * Deliberately fail-safe in the conservative direction: a typo like "treu" still
+ * enables read-only mode rather than silently leaving the write surface exposed.
+ */
+export function readOnlyMode(): boolean {
+  const value = process.env.DISCORD_MCP_READ_ONLY?.trim();
+  if (value === undefined || value === "") return false;
+  return !/^(false|0|no|off)$/i.test(value);
+}
+
+/**
+ * Strips every tool not explicitly annotated `readOnlyHint: true` from a module,
+ * removing both its definition (so clients never see it) and its handler (so a
+ * client calling it anyway gets "Unknown tool"). A missing annotation is treated
+ * as a write: absence of a hint must never grant write access.
+ */
+function onlyReadOnlyTools(mod: ToolModule): ToolModule {
+  const definitions = mod.definitions.filter((d) => d.annotations?.readOnlyHint === true);
+  const readOnlyNames = new Set(definitions.map((d) => d.name));
+  const handlers = new Map([...mod.handlers].filter(([name]) => readOnlyNames.has(name)));
+  return { definitions, handlers };
+}
+
+/**
  * Selects which toolsets to expose from `DISCORD_MCP_TOOLSETS` (comma-separated,
  * case-insensitive). Unset, empty, or `all` exposes everything; unknown names throw
  * at startup: a typo must not silently expose the full destructive surface.
+ * When `DISCORD_MCP_READ_ONLY` is on, every selected module is additionally
+ * filtered down to its read-only tools.
  */
 export function selectModules(): ToolModule[] {
+  const chosen = selectToolsets();
+  return readOnlyMode() ? chosen.map(onlyReadOnlyTools) : chosen;
+}
+
+/** Resolves the `DISCORD_MCP_TOOLSETS` selection, before any read-only filtering. */
+function selectToolsets(): ToolModule[] {
   const raw = process.env.DISCORD_MCP_TOOLSETS?.trim();
   if (!raw) return Object.values(allToolsets);
   const names = [

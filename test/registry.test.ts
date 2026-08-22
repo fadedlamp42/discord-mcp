@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { selectModules, hasTool } from "../src/tools/index.js";
+import { selectModules, readOnlyMode, hasTool } from "../src/tools/index.js";
 import { assertAllowedGuild, isGuildAllowed } from "../src/client.js";
 
 test("selectModules exposes everything when unset or `all`", () => {
@@ -66,6 +66,67 @@ test("every tool's inputSchema forbids unknown keys at every nesting level", () 
       );
       assertStrictObjectSchemas(def.inputSchema, def.name, "inputSchema");
     }
+  }
+});
+
+test("readOnlyMode is off when unset/empty/false-y and on for anything else", () => {
+  delete process.env.DISCORD_MCP_READ_ONLY;
+  assert.equal(readOnlyMode(), false, "unset");
+  try {
+    for (const value of ["", "  ", "false", "0", "no", "off", "FALSE"]) {
+      process.env.DISCORD_MCP_READ_ONLY = value;
+      assert.equal(readOnlyMode(), false, `"${value}" must not enable read-only`);
+    }
+    // a typo fails safe: read-only turns ON rather than leaving writes exposed
+    for (const value of ["true", "1", "yes", "on", "treu", "anything"]) {
+      process.env.DISCORD_MCP_READ_ONLY = value;
+      assert.equal(readOnlyMode(), true, `"${value}" must enable read-only`);
+    }
+  } finally {
+    delete process.env.DISCORD_MCP_READ_ONLY;
+  }
+});
+
+test("read-only mode strips every write tool's definition and handler", () => {
+  delete process.env.DISCORD_MCP_TOOLSETS;
+  process.env.DISCORD_MCP_READ_ONLY = "true";
+  try {
+    const modules = selectModules();
+    for (const mod of modules) {
+      for (const def of mod.definitions) {
+        assert.equal(
+          def.annotations?.readOnlyHint,
+          true,
+          `${def.name} advertised in read-only mode without readOnlyHint: true`,
+        );
+      }
+      for (const name of mod.handlers.keys()) {
+        assert.ok(
+          mod.definitions.some((d) => d.name === name),
+          `${name} handler survived read-only filtering without a definition`,
+        );
+      }
+    }
+    const names = modules.flatMap((m) => m.definitions.map((d) => d.name));
+    assert.ok(names.includes("discord_read_messages"), "read tools stay available");
+    assert.ok(!names.includes("discord_send_message"), "send must be gated off");
+    assert.ok(!names.includes("discord_ban_member"), "moderation writes must be gated off");
+  } finally {
+    delete process.env.DISCORD_MCP_READ_ONLY;
+  }
+});
+
+test("read-only filtering composes with toolset selection", () => {
+  process.env.DISCORD_MCP_TOOLSETS = "messages";
+  process.env.DISCORD_MCP_READ_ONLY = "true";
+  try {
+    const names = selectModules().flatMap((m) => m.definitions.map((d) => d.name));
+    assert.ok(names.length > 0, "messages toolset keeps its read tools");
+    assert.ok(names.includes("discord_read_messages"));
+    assert.ok(!names.includes("discord_send_message"));
+  } finally {
+    delete process.env.DISCORD_MCP_TOOLSETS;
+    delete process.env.DISCORD_MCP_READ_ONLY;
   }
 });
 

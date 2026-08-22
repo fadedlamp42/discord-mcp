@@ -8,6 +8,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { discord } from "./client.js";
 import { createServer } from "./server.js";
+import { readOnlyMode } from "./tools/index.js";
 
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
 const version: string = pkg.version;
@@ -15,7 +16,8 @@ const version: string = pkg.version;
 async function main() {
   const transport = new StdioServerTransport();
   await createServer(version).connect(transport);
-  console.error(`Discord MCP Server v${version} running on stdio.`);
+  const mode = readOnlyMode() ? " (read-only)" : "";
+  console.error(`Discord MCP Server v${version} running on stdio${mode}.`);
 }
 
 function shutdown() {
