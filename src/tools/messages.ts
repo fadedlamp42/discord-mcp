@@ -24,6 +24,40 @@ const messageSummary = z.object({
   timestamp: z.string(),
 });
 
+const reactionSummary = z.object({ emoji: z.string(), count: z.number() });
+const embedSummary = z.object({
+  title: z.string().nullable(),
+  description: z.string().nullable(),
+  author: z.string().nullable(),
+  footer: z.string().nullable(),
+  fields: z.array(z.object({ name: z.string(), value: z.string() })),
+});
+
+/**
+ * Renders a message's reactions as emoji + count. Custom emoji use the "name:id"
+ * form discord_get_reactions accepts, so the output can be fed straight back in.
+ */
+function summarizeReactions(msg: Message): z.infer<typeof reactionSummary>[] {
+  return [...msg.reactions.cache.values()].map((r) => ({
+    emoji: r.emoji.id ? `${r.emoji.name}:${r.emoji.id}` : (r.emoji.name ?? ""),
+    count: r.count,
+  }));
+}
+
+/**
+ * Renders a message's embeds as text. Bots (Carl-bot logging, Dyno) post with an
+ * empty `content` and everything in embeds, so without this those messages read as blank.
+ */
+function summarizeEmbeds(msg: Message): z.infer<typeof embedSummary>[] {
+  return msg.embeds.map((e) => ({
+    title: e.title,
+    description: e.description,
+    author: e.author?.name ?? null,
+    footer: e.footer?.text ?? null,
+    fields: e.fields.map((f) => ({ name: f.name, value: f.value })),
+  }));
+}
+
 /**
  * Looks up a reaction on a message by emoji argument.
  * The reaction cache is keyed by the emoji id (snowflake) for custom emoji and
@@ -41,20 +75,33 @@ const tools = [
   defineTool({
     name: "discord_read_messages",
     description:
-      "Read the most recent messages from a text channel or thread, oldest-to-newest. Returns { messages: [...] } with id, author, content, timestamp, attachment count, pinned flag. Use discord_search_messages to filter by keyword, or discord_fetch_pinned_messages for pinned messages only.",
+      "Read the most recent messages from a text channel or thread, oldest-to-newest. Returns { messages: [...] } with id, author, content, timestamp, attachment count, pinned flag, reactions (emoji + count), and embeds (title, description, author, footer, fields — bot log messages carry everything here and have empty content). Pass `before` (a message ID) to page further back in history. Use discord_search_messages to filter by keyword, or discord_fetch_pinned_messages for pinned messages only.",
     annotations: { title: "Read messages", readOnlyHint: true, openWorldHint: true },
     schema: z.object({
       channel_id: snowflake.describe("ID (snowflake) of the channel or thread to read from."),
       limit: intIn(1, MAX_FETCH_LIMIT)
         .default(DEFAULTS.MESSAGES)
         .describe("How many recent messages to fetch (1–100). Default 20."),
+      before: snowflake
+        .optional()
+        .describe(
+          "Pagination cursor: only return messages older than this message ID. Pass the previous response's oldestId to read further back.",
+        ),
     }),
     outputSchema: z.object({
-      messages: z.array(messageSummary.extend({ attachments: z.number(), pinned: z.boolean() })),
+      messages: z.array(
+        messageSummary.extend({
+          attachments: z.number(),
+          pinned: z.boolean(),
+          reactions: z.array(reactionSummary),
+          embeds: z.array(embedSummary),
+        }),
+      ),
+      oldestId: z.string().nullable(),
     }),
-    handle: async ({ channel_id, limit }) => {
+    handle: async ({ channel_id, limit, before }) => {
       const channel = await getTextChannel(channel_id);
-      const messages = await channel.messages.fetch({ limit, cache: false });
+      const messages = await channel.messages.fetch({ limit, before, cache: false });
       const result = [...messages.values()]
         .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
         .map((m) => ({
@@ -64,8 +111,10 @@ const tools = [
           timestamp: m.createdAt.toISOString(),
           attachments: m.attachments.size,
           pinned: m.pinned,
+          reactions: summarizeReactions(m),
+          embeds: summarizeEmbeds(m),
         }));
-      return structured({ messages: result });
+      return structured({ messages: result, oldestId: result[0]?.id ?? null });
     },
   }),
   defineTool({
@@ -476,7 +525,8 @@ const tools = [
       query: z.string().describe("Search query (case-insensitive)."),
       channel_id: snowflake.optional().describe("Optional. Restrict search to this channel ID."),
       author_id: snowflake.optional().describe("Optional. Only show messages from this user ID."),
-      limit: intIn(1, 100).default(25).describe("Max messages to return (1–100). Default 25."),
+      // NOTE: Discord's search endpoint caps limit at 25 and rejects anything larger with 50035.
+      limit: intIn(1, 25).default(25).describe("Max messages to return (1–25). Default 25."),
     }),
     outputSchema: z.object({
       matches: z.array(
@@ -634,7 +684,7 @@ const tools = [
   defineTool({
     name: "discord_get_reactions",
     description:
-      "List the users who reacted to a message with a specific emoji. Returns { reactions: [...] } with id, username, bot flag. Read-only.",
+      'List the users who reacted to a message with a specific emoji, ordered by user ID. Returns { total, reactions: [...], nextCursor } — `total` is the reaction\'s full count; if nextCursor is non-null, pass it back as `after` for the next page. Pass `user_id` instead to answer "did this one user react?" directly ({ total, reacted }). Use discord_read_messages to see which emoji a message carries. Read-only.',
     annotations: { title: "Get reactions", readOnlyHint: true, openWorldHint: true },
     schema: z.object({
       channel_id: channelId.describe(
@@ -644,30 +694,52 @@ const tools = [
       emoji: z.string().describe("Unicode emoji or custom emoji 'name:id' to list reactors for."),
       limit: intIn(1, MAX_FETCH_LIMIT)
         .default(DEFAULTS.LIMIT)
-        .describe("Max users to return (1–100). Default 25."),
+        .describe("Max users to return per page (1–100). Default 25."),
+      after: snowflake
+        .optional()
+        .describe(
+          "Pagination cursor: a user ID. Pass the previous response's nextCursor to fetch the next page.",
+        ),
+      user_id: snowflake
+        .optional()
+        .describe(
+          "Check whether this one user reacted, scanning every page. Ignores limit/after and returns { total, reacted }.",
+        ),
     }),
     outputSchema: z.object({
-      reactions: z.array(
-        z.object({
-          id: z.string(),
-          username: z.string(),
-          bot: z.boolean(),
-        }),
-      ),
+      total: z.number(),
+      reactions: z
+        .array(
+          z.object({
+            id: z.string(),
+            username: z.string(),
+            bot: z.boolean(),
+          }),
+        )
+        .optional(),
+      nextCursor: z.string().nullable().optional(),
+      reacted: z.boolean().optional(),
     }),
-    handle: async ({ channel_id, message_id, emoji, limit }) => {
+    handle: async ({ channel_id, message_id, emoji, limit, after, user_id }) => {
       const channel = await getTextChannel(channel_id);
       const msg = await channel.messages.fetch({ message: message_id, cache: false });
       const reaction = findReaction(msg, emoji);
       if (!reaction)
         throw new Error(`No reaction found for emoji "${emoji}" on message ${msg.id}.`);
-      const users = await reaction.users.fetch({ limit });
+      if (user_id) {
+        // reactors come back ordered by user ID, so a cursor at user_id - 1 lands on them directly
+        const cursorJustBefore = (BigInt(user_id) - 1n).toString();
+        const page = await reaction.users.fetch({ limit: 1, after: cursorJustBefore });
+        return structured({ total: reaction.count, reacted: page.has(user_id) });
+      }
+      const users = await reaction.users.fetch({ limit, after });
       const result = [...users.values()].map((u) => ({
         id: u.id,
         username: u.username,
         bot: u.bot,
       }));
-      return structured({ reactions: result });
+      const nextCursor = users.size === limit ? (users.lastKey() ?? null) : null;
+      return structured({ total: reaction.count, reactions: result, nextCursor });
     },
   }),
   defineTool({

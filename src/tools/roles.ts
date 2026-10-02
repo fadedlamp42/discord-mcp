@@ -1,4 +1,4 @@
-import { ColorResolvable, Role, Guild } from "discord.js";
+import { ColorResolvable, Role, Guild, GuildMemberFlags } from "discord.js";
 import { z } from "zod";
 import {
   discord,
@@ -6,7 +6,15 @@ import {
   deserializePermissions,
   parsePermissionNames,
 } from "../client.js";
-import { defineTool, defineModule, snowflake, guildId, structured, httpUrl } from "./define.js";
+import {
+  defineTool,
+  defineModule,
+  snowflake,
+  guildId,
+  intIn,
+  structured,
+  httpUrl,
+} from "./define.js";
 
 const roleId = snowflake.describe("ID (snowflake) of the role to edit.");
 
@@ -272,6 +280,76 @@ const tools = [
           ? `Only the first ${MAX_PAGES * 1000} members were scanned; results may be incomplete on very large servers.`
           : undefined,
       });
+    },
+  }),
+  defineTool({
+    name: "discord_get_members_without_role",
+    description:
+      "List human members who do NOT hold a specific role, scanning up to 20,000 members. The inverse of discord_get_role_members, built for gate audits (who never got Verified?). Each row carries joinedAt, `pending` (has not passed Discord's native rules screening), and `onboardingCompleted` (finished Discord's native onboarding flow). Optionally only count members who joined before `joined_before`, to skip people still mid-onboarding. Returns { total, members: [...], truncated }; `members` is capped by `limit`, `total` is not. Bots are excluded. Read-only.",
+    annotations: { title: "Get members without role", readOnlyHint: true, openWorldHint: true },
+    schema: z.object({
+      guild_id: guildId,
+      role_id: snowflake.describe("ID (snowflake) of the role the listed members are missing."),
+      joined_before: z.iso
+        .datetime()
+        .optional()
+        .describe("Only include members who joined before this ISO 8601 instant."),
+      limit: intIn(1, 1000)
+        .default(100)
+        .describe("Max member rows to return (1–1000). Default 100. `total` always counts all."),
+    }),
+    outputSchema: z.object({
+      total: z.number(),
+      members: z.array(
+        z.object({
+          id: z.string(),
+          username: z.string(),
+          joinedAt: z.string().nullable(),
+          pending: z.boolean(),
+          onboardingCompleted: z.boolean(),
+        }),
+      ),
+      truncated: z.boolean(),
+    }),
+    handle: async ({ guild_id, role_id, joined_before, limit }) => {
+      const guild = await discord.guilds.fetch(guild_id);
+      const role = await fetchRole(guild, role_id);
+      const joinedBeforeMs = joined_before ? Date.parse(joined_before) : Infinity;
+      const MAX_PAGES = 20;
+      let after: string | undefined;
+      let truncated = true;
+      let total = 0;
+      const members: {
+        id: string;
+        username: string;
+        joinedAt: string | null;
+        pending: boolean;
+        onboardingCompleted: boolean;
+      }[] = [];
+      for (let i = 0; i < MAX_PAGES; i++) {
+        const page = await guild.members.list({ limit: 1000, after });
+        for (const m of page.values()) {
+          const isMissingRole = !m.user.bot && !m.roles.cache.has(role.id);
+          const joinedInWindow = (m.joinedTimestamp ?? 0) < joinedBeforeMs;
+          if (isMissingRole && joinedInWindow) {
+            total++;
+            if (members.length < limit)
+              members.push({
+                id: m.id,
+                username: m.user.tag,
+                joinedAt: m.joinedAt?.toISOString() ?? null,
+                pending: m.pending,
+                onboardingCompleted: m.flags.has(GuildMemberFlags.CompletedOnboarding),
+              });
+          }
+        }
+        if (page.size < 1000) {
+          truncated = false;
+          break;
+        }
+        after = page.lastKey();
+      }
+      return structured({ total, members, truncated });
     },
   }),
   defineTool({
