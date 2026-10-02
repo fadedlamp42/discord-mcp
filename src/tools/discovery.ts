@@ -1,4 +1,4 @@
-import { ChannelType, CategoryChannel, GuildChannel } from "discord.js";
+import { ChannelType, CategoryChannel, GuildChannel, GuildBasedChannel } from "discord.js";
 import { z } from "zod";
 import { discord, isGuildAllowed } from "../client.js";
 import { defineTool, defineModule, guildId, structured } from "./define.js";
@@ -14,7 +14,30 @@ const channelSummary = z.object({
   id: z.string(),
   name: z.string(),
   type: z.string(),
+  // age-restricted ("NSFW") flag; null for channel types that cannot carry it (categories, threads)
+  nsfw: z.boolean().nullable(),
+  // true when the channel's overwrites mirror its category, false when it has its own,
+  // null when it has no category to sync with
+  permissionsSynced: z.boolean().nullable(),
+  // number of per-channel permission overwrites; read them with discord_get_channel_permissions
+  overwriteCount: z.number(),
 });
+
+/** Summarizes one channel, including the moderation-relevant flags a channel list should surface. */
+function summarizeChannel(channel: GuildBasedChannel) {
+  const nsfw = "nsfw" in channel && typeof channel.nsfw === "boolean" ? channel.nsfw : null;
+  const isGuildChannel = channel instanceof GuildChannel;
+  const permissionsSynced = isGuildChannel && channel.parent ? channel.permissionsLocked : null;
+  const overwriteCount = isGuildChannel ? channel.permissionOverwrites.cache.size : 0;
+  return {
+    id: channel.id,
+    name: channel.name,
+    type: ChannelType[channel.type],
+    nsfw,
+    permissionsSynced: permissionsSynced ?? null,
+    overwriteCount,
+  };
+}
 
 /** Tool definitions for server/guild discovery and channel navigation. */
 const tools = [
@@ -76,7 +99,7 @@ const tools = [
   defineTool({
     name: "discord_list_channels",
     description:
-      "List all channels in a server, grouped by their parent category and ordered by position. Returns a JSON object keyed by category name. Read-only. Use discord_find_channel_by_name to locate a specific channel.",
+      "List all channels in a server, grouped by their parent category and ordered by position. Returns a JSON object keyed by category name; each channel carries nsfw (age-restricted flag), permissionsSynced (mirrors its category or not), and overwriteCount. Read-only. Use discord_find_channel_by_name to locate a specific channel.",
     annotations: { title: "List channels", readOnlyHint: true, openWorldHint: true },
     schema: z.object({
       guild_id: guildId,
@@ -98,7 +121,7 @@ const tools = [
         .filter((c) => c.type !== ChannelType.GuildCategory)
         .sort((a, b) => (a as GuildChannel).position - (b as GuildChannel).position)
         .forEach((ch) => {
-          const entry = { id: ch.id, name: ch.name, type: ChannelType[ch.type] };
+          const entry = summarizeChannel(ch);
           const parentName = (ch as GuildChannel).parent?.name ?? "No Category";
           if (!result[parentName]) result[parentName] = [];
           result[parentName].push(entry);
@@ -123,7 +146,7 @@ const tools = [
       const keyword = name.toLowerCase();
       const matches = guild.channels.cache
         .filter((c) => c.name.toLowerCase().includes(keyword))
-        .map((c) => ({ id: c.id, name: c.name, type: ChannelType[c.type] }));
+        .map((c) => summarizeChannel(c));
       return structured({ matches });
     },
   }),
