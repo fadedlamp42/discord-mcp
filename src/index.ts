@@ -28,6 +28,13 @@ function shutdown() {
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// The SDK's StdioServerTransport never listens for stdin EOF, and the Discord
+// gateway socket keeps the event loop alive on its own, so a client that exits
+// or crashes without signalling would leave this process orphaned forever.
+// stdin closing is the client hanging up: treat it as a shutdown request.
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
 process.on("unhandledRejection", (reason) => console.error("Unhandled rejection:", reason));
 process.on("uncaughtException", (err) => console.error("Uncaught exception:", err));
 
